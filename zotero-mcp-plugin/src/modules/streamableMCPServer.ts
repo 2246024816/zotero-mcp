@@ -900,8 +900,8 @@ export class StreamableMCPServer {
           properties: {
             action: {
               type: 'string',
-              enum: ['create', 'reparent'],
-              description: 'create: create a new item with metadata. reparent: move an attachment under a different parent item.'
+              enum: ['create', 'reparent', 'importAttachment'],
+              description: 'create: create a new item with metadata. reparent: move an attachment under a different parent item. importAttachment: import a local PDF/file as a new attachment to an existing item.'
             },
             itemType: {
               type: 'string',
@@ -939,6 +939,15 @@ export class StreamableMCPServer {
             parentKey: {
               type: 'string',
               description: 'For reparent action: the target parent item key to move attachments to'
+            },
+            filePath: {
+              type: 'string',
+              description: 'For importAttachment action: absolute path to the local PDF or file to import as an attachment'
+            },
+            importMode: {
+              type: 'string',
+              enum: ['import', 'link'],
+              description: 'For importAttachment action: "import" copies file to Zotero storage (default), "link" links to the external file without copying'
             }
           },
           required: ['action']
@@ -2128,7 +2137,7 @@ export class StreamableMCPServer {
    * Handle write_item tool calls: create items and reparent attachments
    */
   private async callWriteItem(args: any): Promise<any> {
-    const { action, itemType, fields, creators, tags, attachmentKeys, parentKey } = args;
+    const { action, itemType, fields, creators, tags, attachmentKeys, parentKey, filePath, importMode } = args;
 
     try {
       switch (action) {
@@ -2214,6 +2223,82 @@ export class StreamableMCPServer {
             metadata: {
               extractedAt: new Date().toISOString(),
               message: `Item created (key: ${item.key}, type: ${itemType})${reparentedAttachments.length > 0 ? `, ${reparentedAttachments.length} attachment(s) attached` : ''}`
+            }
+          };
+        }
+
+        case 'importAttachment': {
+          if (!filePath) {
+            throw new Error('filePath is required for importAttachment action (absolute path to local PDF/file)');
+          }
+          if (!parentKey) {
+            throw new Error('parentKey is required for importAttachment action (target item to attach file to)');
+          }
+
+          // Verify parent exists
+          const parentItem = Zotero.Items.getByLibraryAndKey(
+            Zotero.Libraries.userLibraryID, parentKey
+          );
+          if (!parentItem) {
+            throw new Error(`Parent item not found: ${parentKey}`);
+          }
+
+          // Check file exists
+          const file = Zotero.File.pathToFile(filePath);
+          if (!file.exists()) {
+            throw new Error(`File not found: ${filePath}`);
+          }
+
+          // Determine content type from file extension
+          const ext = (filePath.split('.').pop() || '').toLowerCase();
+          const contentTypeMap: Record<string, string> = {
+            pdf: 'application/pdf',
+            docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            doc: 'application/msword',
+            xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            txt: 'text/plain',
+            html: 'text/html',
+            htm: 'text/html',
+            md: 'text/markdown',
+            rtf: 'application/rtf',
+            odt: 'application/vnd.oasis.opendocument.text',
+          };
+          const contentType = contentTypeMap[ext] || 'application/octet-stream';
+
+          const importMode = args.importMode || 'import';
+
+          let attachment: Zotero.Item;
+          if (importMode === 'link') {
+            attachment = await Zotero.Attachments.linkFromFile({
+              file,
+              parentItemID: parentItem.id,
+              contentType,
+            });
+          } else {
+            attachment = await Zotero.Attachments.importFromFile({
+              file,
+              parentItemID: parentItem.id,
+              contentType,
+            });
+          }
+
+          ztoolkit.log(`[StreamableMCP] Imported attachment ${attachment.key} (${importMode}) under ${parentKey}`);
+
+          return {
+            action: 'importAttachment',
+            success: true,
+            data: {
+              parentKey,
+              attachmentKey: attachment.key,
+              path: attachment.getFilePath(),
+              contentType,
+              importMode,
+              dateCreated: attachment.dateAdded
+            },
+            metadata: {
+              extractedAt: new Date().toISOString(),
+              message: `Attachment imported (key: ${attachment.key}, mode: ${importMode}) under parent ${parentKey}`
             }
           };
         }

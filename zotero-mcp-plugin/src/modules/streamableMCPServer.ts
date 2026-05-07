@@ -952,6 +952,25 @@ export class StreamableMCPServer {
           },
           required: ['action']
         }
+      },
+      {
+        name: 'delete_item',
+        description: 'Delete one or more Zotero items by their item keys. WARNING: This permanently moves items to the trash. Items in trash can be recovered manually.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            itemKeys: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Array of item keys to delete'
+            },
+            permanent: {
+              type: 'boolean',
+              description: 'If true, permanently delete. If false/omitted, move to trash (recoverable).'
+            }
+          },
+          required: ['itemKeys']
+        }
       }
     ];
 
@@ -965,7 +984,7 @@ export class StreamableMCPServer {
     // Filter out write tools if write operations are disabled (default: disabled)
     const writeEnabled = Zotero.Prefs.get('extensions.zotero.zotero-mcp-plugin.write.enabled', true);
     const writeToolNames = new Set([
-      'write_note', 'write_tag', 'write_metadata', 'write_item',
+      'write_note', 'write_tag', 'write_metadata', 'write_item', 'delete_item',
     ]);
     const finalTools = writeEnabled === true
       ? filteredTools
@@ -1199,6 +1218,18 @@ export class StreamableMCPServer {
             throw new Error('action is required');
           }
           result = await this.callWriteItem(args);
+          break;
+        }
+
+        case 'delete_item': {
+          const writeEnabled5 = Zotero.Prefs.get('extensions.zotero.zotero-mcp-plugin.write.enabled', true);
+          if (writeEnabled5 !== true) {
+            throw new Error('Write operations are currently disabled.');
+          }
+          if (!args?.itemKeys || !Array.isArray(args.itemKeys)) {
+            throw new Error('itemKeys array is required');
+          }
+          result = await this.callDeleteItem(args);
           break;
         }
 
@@ -2368,6 +2399,64 @@ export class StreamableMCPServer {
       }
     } catch (error) {
       ztoolkit.log(`[StreamableMCP] Write item error: ${error}`, 'error');
+      return {
+        success: false,
+        error: String(error)
+      };
+    }
+  }
+
+  /**
+   * Handle delete_item tool calls: move items to trash or permanently delete
+   */
+  private async callDeleteItem(args: any): Promise<any> {
+    const { itemKeys, permanent = false } = args;
+
+    try {
+      const results: Array<{ key: string; success: boolean; title?: string; error?: string }> = [];
+      let deletedCount = 0;
+
+      for (const key of itemKeys) {
+        try {
+          const item = Zotero.Items.getByLibraryAndKey(Zotero.Libraries.userLibraryID, key);
+          if (!item) {
+            results.push({ key, success: false, error: 'Item not found' });
+            continue;
+          }
+
+          const title = item.getField('title') || item.attachmentFilename || 'No Title';
+
+          if (permanent) {
+            await item.eraseTx();
+          } else {
+            item.trashTx();
+            await item.saveTx();
+          }
+
+          deletedCount++;
+          results.push({ key, success: true, title });
+          ztoolkit.log(`[StreamableMCP] Deleted item ${key}: ${title}`);
+        } catch (itemError) {
+          results.push({ key, success: false, error: String(itemError) });
+          ztoolkit.log(`[StreamableMCP] Failed to delete ${key}: ${itemError}`, 'error');
+        }
+      }
+
+      return {
+        success: deletedCount > 0,
+        data: {
+          permanent,
+          results,
+          deletedCount,
+          totalCount: itemKeys.length
+        },
+        metadata: {
+          extractedAt: new Date().toISOString(),
+          message: `Deleted ${deletedCount}/${itemKeys.length} item(s)${permanent ? ' (permanently)' : ' (to trash)'}`
+        }
+      };
+    } catch (error) {
+      ztoolkit.log(`[StreamableMCP] Delete item error: ${error}`, 'error');
       return {
         success: false,
         error: String(error)
